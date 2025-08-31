@@ -3,6 +3,8 @@ use regex::Regex;
 use arboard::Clipboard;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::path::Path;
+use image::{ImageBuffer, Rgb, RgbImage};
 
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
@@ -30,6 +32,13 @@ struct TextElement {
     font_size: f32,
 }
 
+#[derive(Clone)]
+struct Page {
+    strokes: Vec<Stroke>,
+    text_elements: Vec<TextElement>,
+    name: String,
+}
+
 // Serializable versions for saving/loading
 #[derive(Serialize, Deserialize)]
 struct SerializableStroke {
@@ -43,6 +52,20 @@ struct SerializableTextElement {
     position: (f32, f32),
     text: String,
     font_size: f32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SerializablePage {
+    strokes: Vec<SerializableStroke>,
+    text_elements: Vec<SerializableTextElement>,
+    name: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ScribbleNotebook {
+    pages: Vec<SerializablePage>,
+    current_page_index: usize,
+    canvas_size: (f32, f32),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -60,8 +83,13 @@ enum Tool {
 }
 
 struct ScribbleApp {
-    strokes: Vec<Stroke>,
-    text_elements: Vec<TextElement>,
+    // Multi-page notebook support
+    pages: Vec<Page>,
+    current_page_index: usize,
+    is_notebook_mode: bool,
+    show_create_notebook_dialog: bool,
+    new_notebook_pages_input: String,
+    
     current_stroke: Vec<egui::Pos2>,
     is_drawing: bool,
     stroke_color: egui::Color32,
@@ -83,13 +111,22 @@ struct ScribbleApp {
     selection_end: Option<egui::Pos2>,
     selected_text_elements: Vec<usize>,
     clipboard: Option<Clipboard>,
+    // Drag and drop state
+    is_file_hovered: bool,
 }
 
 impl Default for ScribbleApp {
     fn default() -> Self {
         Self {
-            strokes: Vec::new(),
-            text_elements: Vec::new(),
+            pages: vec![Page {
+                strokes: Vec::new(),
+                text_elements: Vec::new(),
+                name: "Page 1".to_string(),
+            }],
+            current_page_index: 0,
+            is_notebook_mode: false,
+            show_create_notebook_dialog: false,
+            new_notebook_pages_input: "5".to_string(),
             current_stroke: Vec::new(),
             is_drawing: false,
             stroke_color: egui::Color32::BLACK,
@@ -110,11 +147,127 @@ impl Default for ScribbleApp {
             selection_end: None,
             selected_text_elements: Vec::new(),
             clipboard: Clipboard::new().ok(),
+            // Drag and drop state
+            is_file_hovered: false,
         }
     }
 }
 
 impl ScribbleApp {
+    // Helper methods for current page access
+    fn current_page(&self) -> &Page {
+        &self.pages[self.current_page_index]
+    }
+    
+    fn current_page_mut(&mut self) -> &mut Page {
+        &mut self.pages[self.current_page_index]
+    }
+    
+    fn current_strokes(&self) -> &Vec<Stroke> {
+        &self.current_page().strokes
+    }
+    
+    fn current_strokes_mut(&mut self) -> &mut Vec<Stroke> {
+        &mut self.current_page_mut().strokes
+    }
+    
+    fn current_text_elements(&self) -> &Vec<TextElement> {
+        &self.current_page().text_elements
+    }
+    
+    fn current_text_elements_mut(&mut self) -> &mut Vec<TextElement> {
+        &mut self.current_page_mut().text_elements
+    }
+    
+    // Calculate content bounds for export
+    fn calculate_content_bounds(&self) -> (f32, f32, f32, f32) {
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        
+        // Check stroke bounds
+        for stroke in self.current_strokes() {
+            for point in &stroke.points {
+                min_x = min_x.min(point.x);
+                min_y = min_y.min(point.y);
+                max_x = max_x.max(point.x);
+                max_y = max_y.max(point.y);
+            }
+        }
+        
+        // Check text element bounds
+        for text_element in self.current_text_elements() {
+            let lines: Vec<&str> = text_element.text.lines().collect();
+            let line_height = text_element.font_size * 1.2;
+            
+            for (line_idx, line) in lines.iter().enumerate() {
+                if !line.trim().is_empty() {
+                    let line_y = text_element.position.y + (line_idx as f32) * line_height;
+                    let estimated_width = line.len() as f32 * text_element.font_size * 0.6;
+                    
+                    min_x = min_x.min(text_element.position.x);
+                    min_y = min_y.min(line_y);
+                    max_x = max_x.max(text_element.position.x + estimated_width);
+                    max_y = max_y.max(line_y + text_element.font_size);
+                }
+            }
+        }
+        
+        // If no content, return default canvas size
+        if min_x == f32::INFINITY {
+            return (0.0, 0.0, 800.0, 600.0);
+        }
+        
+        // Add padding around content
+        let padding = 20.0;
+        min_x -= padding;
+        min_y -= padding;
+        max_x += padding;
+        max_y += padding;
+        
+        // Ensure minimum size
+        let width = (max_x - min_x).max(400.0);
+        let height = (max_y - min_y).max(300.0);
+        
+        (min_x, min_y, width, height)
+    }
+
+    // Notebook management methods
+    fn create_notebook(&mut self, page_count: usize) {
+        self.pages.clear();
+        for i in 1..=page_count {
+            self.pages.push(Page {
+                strokes: Vec::new(),
+                text_elements: Vec::new(),
+                name: format!("Page {}", i),
+            });
+        }
+        self.current_page_index = 0;
+        self.is_notebook_mode = true;
+    }
+    
+    fn add_new_page(&mut self) {
+        let page_number = self.pages.len() + 1;
+        self.pages.push(Page {
+            strokes: Vec::new(),
+            text_elements: Vec::new(),
+            name: format!("Page {}", page_number),
+        });
+    }
+    
+    fn next_page(&mut self) {
+        if self.current_page_index < self.pages.len() - 1 {
+            self.current_page_index += 1;
+        }
+    }
+    
+    fn previous_page(&mut self) {
+        if self.current_page_index > 0 {
+            self.current_page_index -= 1;
+        }
+    }
+    
     fn perform_search(&mut self) {
         self.search_results.clear();
         self.search_error = None;
@@ -123,10 +276,12 @@ impl ScribbleApp {
             return;
         }
         
+        let text_elements = self.current_text_elements().clone();
+        
         if self.regex_mode {
             match Regex::new(&self.search_query) {
                 Ok(regex) => {
-                    for (index, text_element) in self.text_elements.iter().enumerate() {
+                    for (index, text_element) in text_elements.iter().enumerate() {
                         if regex.is_match(&text_element.text) {
                             self.search_results.push(index);
                         }
@@ -138,7 +293,7 @@ impl ScribbleApp {
             }
         } else {
             let query_lower = self.search_query.to_lowercase();
-            for (index, text_element) in self.text_elements.iter().enumerate() {
+            for (index, text_element) in text_elements.iter().enumerate() {
                 if text_element.text.to_lowercase().contains(&query_lower) {
                     self.search_results.push(index);
                 }
@@ -154,7 +309,7 @@ impl ScribbleApp {
         }
         
         for &index in &self.search_results {
-            if let Some(text_element) = self.text_elements.get(index) {
+            if let Some(text_element) = self.current_text_elements().get(index) {
                 let matches = self.get_match_positions(&text_element.text);
                 total_matches += matches.len();
             }
@@ -320,7 +475,7 @@ impl ScribbleApp {
         );
         
         // Only check for collisions with other text elements (not the one being searched)
-        for (text_idx, text_element) in self.text_elements.iter().enumerate() {
+        for (text_idx, text_element) in self.current_text_elements().iter().enumerate() {
             // Skip text elements that are search results (we want to point to them)
             if self.search_results.contains(&text_idx) {
                 continue;
@@ -421,7 +576,8 @@ impl ScribbleApp {
         if let (Some(start), Some(end)) = (self.selection_start, self.selection_end) {
             let selection_rect = egui::Rect::from_two_pos(start, end);
             
-            for (idx, text_element) in self.text_elements.iter().enumerate() {
+            let text_elements = self.current_text_elements().clone();
+            for (idx, text_element) in text_elements.iter().enumerate() {
                 let lines: Vec<&str> = text_element.text.lines().collect();
                 let font_size = text_element.font_size;
                 let line_height = font_size * 1.2;
@@ -449,7 +605,7 @@ impl ScribbleApp {
     }
     
     fn get_text_element_at_position(&self, pos: egui::Pos2) -> Option<usize> {
-        for (idx, text_element) in self.text_elements.iter().enumerate() {
+        for (idx, text_element) in self.current_text_elements().iter().enumerate() {
             let lines: Vec<&str> = text_element.text.lines().collect();
             let font_size = text_element.font_size;
             let line_height = font_size * 1.2;
@@ -482,7 +638,7 @@ impl ScribbleApp {
         
         let mut combined_text = String::new();
         for &text_idx in &self.selected_text_elements {
-            if let Some(text_element) = self.text_elements.get(text_idx) {
+            if let Some(text_element) = self.current_text_elements().get(text_idx) {
                 if !combined_text.is_empty() {
                     combined_text.push('\n');
                 }
@@ -504,8 +660,9 @@ impl ScribbleApp {
             let offset = current_pos - start_pos;
             
             // Apply offset to all selected text elements
-            for &text_idx in &self.selected_text_elements {
-                if let Some(text_element) = self.text_elements.get_mut(text_idx) {
+            let selected_indices = self.selected_text_elements.clone();
+            for text_idx in selected_indices {
+                if let Some(text_element) = self.current_text_elements_mut().get_mut(text_idx) {
                     text_element.position = text_element.position + offset;
                 }
             }
@@ -523,22 +680,47 @@ impl ScribbleApp {
             .set_file_name("my_drawing.scribble")
             .save_file()
         {
-            let project = ScribbleProject {
-                strokes: self.strokes.iter().map(|s| SerializableStroke {
-                    points: s.points.iter().map(|p| (p.x, p.y)).collect(),
-                    color: (s.color.r(), s.color.g(), s.color.b()),
-                    width: s.width,
-                }).collect(),
-                text_elements: self.text_elements.iter().map(|t| SerializableTextElement {
-                    position: (t.position.x, t.position.y),
-                    text: t.text.clone(),
-                    font_size: t.font_size,
-                }).collect(),
-                canvas_size: (800.0, 600.0), // Default canvas size
-            };
-            
-            let json = serde_json::to_string_pretty(&project)?;
-            fs::write(path, json)?;
+            if self.is_notebook_mode {
+                // Save as notebook
+                let notebook = ScribbleNotebook {
+                    pages: self.pages.iter().map(|p| SerializablePage {
+                        name: p.name.clone(),
+                        strokes: p.strokes.iter().map(|s| SerializableStroke {
+                            points: s.points.iter().map(|pos| (pos.x, pos.y)).collect(),
+                            color: (s.color.r(), s.color.g(), s.color.b()),
+                            width: s.width,
+                        }).collect(),
+                        text_elements: p.text_elements.iter().map(|t| SerializableTextElement {
+                            position: (t.position.x, t.position.y),
+                            text: t.text.clone(),
+                            font_size: t.font_size,
+                        }).collect(),
+                    }).collect(),
+                    current_page_index: self.current_page_index,
+                    canvas_size: (800.0, 600.0),
+                };
+                
+                let json = serde_json::to_string_pretty(&notebook)?;
+                fs::write(path, json)?;
+            } else {
+                // Save as single page project (backwards compatibility)
+                let project = ScribbleProject {
+                    strokes: self.current_strokes().iter().map(|s| SerializableStroke {
+                        points: s.points.iter().map(|p| (p.x, p.y)).collect(),
+                        color: (s.color.r(), s.color.g(), s.color.b()),
+                        width: s.width,
+                    }).collect(),
+                    text_elements: self.current_text_elements().iter().map(|t| SerializableTextElement {
+                        position: (t.position.x, t.position.y),
+                        text: t.text.clone(),
+                        font_size: t.font_size,
+                    }).collect(),
+                    canvas_size: (800.0, 600.0), // Default canvas size
+                };
+                
+                let json = serde_json::to_string_pretty(&project)?;
+                fs::write(path, json)?;
+            }
         }
         Ok(())
     }
@@ -549,11 +731,80 @@ impl ScribbleApp {
             .pick_file()
         {
             let json = fs::read_to_string(path)?;
-            let project: ScribbleProject = serde_json::from_str(&json)?;
             
-            // Clear current content
-            self.strokes.clear();
-            self.text_elements.clear();
+            // Try to load as notebook first
+            if let Ok(notebook) = serde_json::from_str::<ScribbleNotebook>(&json) {
+                // Clear current state
+                self.pages.clear();
+                self.current_stroke.clear();
+                self.is_drawing = false;
+                self.selected_text_elements.clear();
+                self.is_selecting_text = false;
+                self.selection_start = None;
+                self.selection_end = None;
+                self.search_results.clear();
+                self.search_query.clear();
+                
+                // Load notebook
+                self.pages = notebook.pages.into_iter().map(|p| Page {
+                    name: p.name,
+                    strokes: p.strokes.into_iter().map(|s| Stroke {
+                        points: s.points.into_iter().map(|(x, y)| egui::Pos2::new(x, y)).collect(),
+                        color: egui::Color32::from_rgb(s.color.0, s.color.1, s.color.2),
+                        width: s.width,
+                    }).collect(),
+                    text_elements: p.text_elements.into_iter().map(|t| TextElement {
+                        position: egui::Pos2::new(t.position.0, t.position.1),
+                        text: t.text,
+                        font_size: t.font_size,
+                    }).collect(),
+                }).collect();
+                
+                self.current_page_index = notebook.current_page_index.min(self.pages.len().saturating_sub(1));
+                self.is_notebook_mode = true;
+            } else if let Ok(project) = serde_json::from_str::<ScribbleProject>(&json) {
+                // Load as single page project (backwards compatibility)
+                self.pages.clear();
+                self.current_stroke.clear();
+                self.is_drawing = false;
+                self.selected_text_elements.clear();
+                self.is_selecting_text = false;
+                self.selection_start = None;
+                self.selection_end = None;
+                self.search_results.clear();
+                self.search_query.clear();
+                
+                // Create single page from project
+                self.pages = vec![Page {
+                    name: "Imported Page".to_string(),
+                    strokes: project.strokes.into_iter().map(|s| Stroke {
+                        points: s.points.into_iter().map(|(x, y)| egui::Pos2::new(x, y)).collect(),
+                        color: egui::Color32::from_rgb(s.color.0, s.color.1, s.color.2),
+                        width: s.width,
+                    }).collect(),
+                    text_elements: project.text_elements.into_iter().map(|t| TextElement {
+                        position: egui::Pos2::new(t.position.0, t.position.1),
+                        text: t.text,
+                        font_size: t.font_size,
+                    }).collect(),
+                }];
+                
+                self.current_page_index = 0;
+                self.is_notebook_mode = false;
+            } else {
+                return Err("Invalid file format".into());
+            }
+        }
+        Ok(())
+    }
+    
+    fn load_project_from_path(&mut self, file_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let json = fs::read_to_string(file_path)?;
+        
+        // Try to load as notebook first
+        if let Ok(notebook) = serde_json::from_str::<ScribbleNotebook>(&json) {
+            // Clear current state
+            self.pages.clear();
             self.current_stroke.clear();
             self.is_drawing = false;
             self.selected_text_elements.clear();
@@ -563,23 +814,59 @@ impl ScribbleApp {
             self.search_results.clear();
             self.search_query.clear();
             
-            // Load strokes
-            self.strokes = project.strokes.into_iter().map(|s| Stroke {
-                points: s.points.into_iter().map(|(x, y)| egui::Pos2::new(x, y)).collect(),
-                color: egui::Color32::from_rgb(s.color.0, s.color.1, s.color.2),
-                width: s.width,
+            // Load notebook
+            self.pages = notebook.pages.into_iter().map(|p| Page {
+                name: p.name,
+                strokes: p.strokes.into_iter().map(|s| Stroke {
+                    points: s.points.into_iter().map(|(x, y)| egui::Pos2::new(x, y)).collect(),
+                    color: egui::Color32::from_rgb(s.color.0, s.color.1, s.color.2),
+                    width: s.width,
+                }).collect(),
+                text_elements: p.text_elements.into_iter().map(|t| TextElement {
+                    position: egui::Pos2::new(t.position.0, t.position.1),
+                    text: t.text,
+                    font_size: t.font_size,
+                }).collect(),
             }).collect();
             
-            // Load text elements
-            self.text_elements = project.text_elements.into_iter().map(|t| TextElement {
-                position: egui::Pos2::new(t.position.0, t.position.1),
-                text: t.text,
-                font_size: t.font_size,
-            }).collect();
+            self.current_page_index = notebook.current_page_index.min(self.pages.len().saturating_sub(1));
+            self.is_notebook_mode = true;
+        } else if let Ok(project) = serde_json::from_str::<ScribbleProject>(&json) {
+            // Load as single page project (backwards compatibility)
+            self.pages.clear();
+            self.current_stroke.clear();
+            self.is_drawing = false;
+            self.selected_text_elements.clear();
+            self.is_selecting_text = false;
+            self.selection_start = None;
+            self.selection_end = None;
+            self.search_results.clear();
+            self.search_query.clear();
+            
+            // Create single page from project
+            self.pages = vec![Page {
+                name: "Imported Page".to_string(),
+                strokes: project.strokes.into_iter().map(|s| Stroke {
+                    points: s.points.into_iter().map(|(x, y)| egui::Pos2::new(x, y)).collect(),
+                    color: egui::Color32::from_rgb(s.color.0, s.color.1, s.color.2),
+                    width: s.width,
+                }).collect(),
+                text_elements: project.text_elements.into_iter().map(|t| TextElement {
+                    position: egui::Pos2::new(t.position.0, t.position.1),
+                    text: t.text,
+                    font_size: t.font_size,
+                }).collect(),
+            }];
+            
+            self.current_page_index = 0;
+            self.is_notebook_mode = false;
+        } else {
+            return Err("Invalid file format".into());
         }
+        
         Ok(())
     }
-    
+
     fn export_svg(&self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("SVG Image", &["svg"])
@@ -588,16 +875,25 @@ impl ScribbleApp {
         {
             let mut svg = String::new();
             
-            // SVG header with light grey background
-            svg.push_str(r#"<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600">"#);
+            // Calculate content bounds
+            let (min_x, min_y, width, height) = self.calculate_content_bounds();
+            
+            // SVG header with calculated dimensions and viewBox
+            svg.push_str(&format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="{:.0}" height="{:.0}" viewBox="{:.0} {:.0} {:.0} {:.0}">"#,
+                width, height, min_x, min_y, width, height
+            ));
             svg.push('\n');
             
             // Background
-            svg.push_str(r#"<rect width="800" height="600" fill="rgb(245,245,245)"/>"#);
+            svg.push_str(&format!(
+                r#"<rect x="{:.0}" y="{:.0}" width="{:.0}" height="{:.0}" fill="rgb(245,245,245)"/>"#,
+                min_x, min_y, width, height
+            ));
             svg.push('\n');
             
             // Export strokes as paths
-            for stroke in &self.strokes {
+            for stroke in self.current_strokes() {
                 if stroke.points.len() > 1 {
                     svg.push_str(&format!(
                         r#"<path d="M{},{}"#,
@@ -618,7 +914,7 @@ impl ScribbleApp {
             }
             
             // Export text elements
-            for text_element in &self.text_elements {
+            for text_element in self.current_text_elements() {
                 // Handle multiline text
                 let lines: Vec<&str> = text_element.text.lines().collect();
                 for (line_idx, line) in lines.iter().enumerate() {
@@ -643,21 +939,139 @@ impl ScribbleApp {
     }
     
     fn export_png(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // Note: PNG export would require rendering to an image buffer
-        // This is a placeholder - full implementation would need image crate
-        if let Some(_path) = rfd::FileDialog::new()
+        if let Some(path) = rfd::FileDialog::new()
             .add_filter("PNG Image", &["png"])
             .set_file_name("my_drawing.png")
             .save_file()
         {
-            // TODO: Implement PNG export
-            // Would require:
-            // 1. Create image buffer
-            // 2. Render all strokes and text to buffer  
-            // 3. Save as PNG using image crate
-            eprintln!("PNG export not yet implemented - use SVG export instead");
+            // Calculate content bounds
+            let (min_x, min_y, width_f, height_f) = self.calculate_content_bounds();
+            let width = width_f as u32;
+            let height = height_f as u32;
+            
+            // Create image buffer with light grey background
+            let mut img: RgbImage = ImageBuffer::new(width, height);
+            let bg_color = Rgb([245u8, 245u8, 245u8]); // Light grey background
+            
+            // Fill background
+            for pixel in img.pixels_mut() {
+                *pixel = bg_color;
+            }
+            
+            // Draw strokes
+            for stroke in self.current_strokes() {
+                if stroke.points.len() > 1 {
+                    let stroke_rgb = Rgb([stroke.color.r(), stroke.color.g(), stroke.color.b()]);
+                    
+                    for i in 0..stroke.points.len() - 1 {
+                        let start = stroke.points[i];
+                        let end = stroke.points[i + 1];
+                        
+                        // Adjust coordinates relative to content bounds
+                        self.draw_line_on_image(
+                            &mut img,
+                            (start.x - min_x) as i32,
+                            (start.y - min_y) as i32,
+                            (end.x - min_x) as i32,
+                            (end.y - min_y) as i32,
+                            stroke_rgb,
+                            stroke.width as u32,
+                        );
+                    }
+                }
+            }
+            
+            // Draw text elements as colored rectangles (placeholder for actual text)
+            for text_element in self.current_text_elements() {
+                let lines: Vec<&str> = text_element.text.lines().collect();
+                let line_height = text_element.font_size * 1.2;
+                
+                for (line_idx, line) in lines.iter().enumerate() {
+                    if !line.trim().is_empty() {
+                        let line_y = text_element.position.y + (line_idx as f32) * line_height;
+                        let estimated_width = line.len() as f32 * text_element.font_size * 0.6;
+                        
+                        // Draw a rectangle to represent text area
+                        let text_color = Rgb([0u8, 0u8, 0u8]); // Black for text
+                        let text_x = (text_element.position.x - min_x) as i32;
+                        let text_y = (line_y - min_y) as i32;
+                        let text_width = estimated_width as i32;
+                        let text_height = text_element.font_size as i32;
+                        
+                        // Draw text background rectangle
+                        for x in text_x..text_x + text_width {
+                            for y in text_y..text_y + text_height {
+                                if x >= 0 && x < width as i32 && y >= 0 && y < height as i32 {
+                                    // Draw a simple pattern to represent text
+                                    if (x + y) % 4 == 0 {
+                                        img.put_pixel(x as u32, y as u32, text_color);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Save the image
+            img.save(path)?;
         }
         Ok(())
+    }
+    
+    // Helper function to draw lines on image buffer
+    fn draw_line_on_image(
+        &self,
+        img: &mut RgbImage,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        color: Rgb<u8>,
+        width: u32,
+    ) {
+        let (width_i, height_i) = img.dimensions();
+        let (img_width, img_height) = (width_i as i32, height_i as i32);
+        
+        // Bresenham's line algorithm
+        let dx = (x1 - x0).abs();
+        let dy = (y1 - y0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx - dy;
+        
+        let mut x = x0;
+        let mut y = y0;
+        
+        loop {
+            // Draw a circle for line thickness
+            for offset_x in -(width as i32 / 2)..=(width as i32 / 2) {
+                for offset_y in -(width as i32 / 2)..=(width as i32 / 2) {
+                    let px = x + offset_x;
+                    let py = y + offset_y;
+                    
+                    // Check if pixel is within stroke radius and image bounds
+                    if offset_x * offset_x + offset_y * offset_y <= (width as i32 / 2).pow(2) &&
+                       px >= 0 && px < img_width && py >= 0 && py < img_height {
+                        img.put_pixel(px as u32, py as u32, color);
+                    }
+                }
+            }
+            
+            if x == x1 && y == y1 {
+                break;
+            }
+            
+            let e2 = 2 * err;
+            if e2 > -dy {
+                err -= dy;
+                x += sx;
+            }
+            if e2 < dx {
+                err += dx;
+                y += sy;
+            }
+        }
     }
     
     fn html_escape(text: &str) -> String {
@@ -675,13 +1089,16 @@ impl ScribbleApp {
             return;
         }
         
+        let text_elements = self.current_text_elements().clone();
+        let search_results = self.search_results.clone();
+        
         // For each text element with search results, check if arrows would collide with other text
-        for &search_index in &self.search_results {
-            if search_index >= self.text_elements.len() {
+        for &search_index in &search_results {
+            if search_index >= text_elements.len() {
                 continue;
             }
             
-            let search_element = &self.text_elements[search_index];
+            let search_element = &text_elements[search_index];
             let positions = self.get_match_positions(&search_element.text);
             
             for (start_char, end_char) in positions {
@@ -739,7 +1156,7 @@ impl ScribbleApp {
                     );
                     
                     // Check collision with other text elements
-                    for (other_index, other_element) in self.text_elements.iter().enumerate() {
+                    for (other_index, other_element) in text_elements.iter().enumerate() {
                         if other_index == search_index {
                             continue;
                         }
@@ -787,12 +1204,71 @@ impl ScribbleApp {
 
 impl eframe::App for ScribbleApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Handle drag and drop for .scribble files
+        self.is_file_hovered = false;
+        ctx.input(|i| {
+            // Check for files being hovered
+            if !i.raw.hovered_files.is_empty() {
+                for file in &i.raw.hovered_files {
+                    if let Some(path) = &file.path {
+                        if let Some(extension) = path.extension() {
+                            if extension == "scribble" {
+                                self.is_file_hovered = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Check for files being dropped
+            if !i.raw.dropped_files.is_empty() {
+                for file in &i.raw.dropped_files {
+                    if let Some(path) = &file.path {
+                        if let Some(extension) = path.extension() {
+                            if extension == "scribble" {
+                                if let Err(e) = self.load_project_from_path(path) {
+                                    eprintln!("Failed to load dropped file: {}", e);
+                                } else {
+                                    // Successfully loaded file
+                                    println!("Successfully loaded: {}", path.display());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        
         egui::CentralPanel::default().show(ctx, |ui| {
             // Top controls
             ui.horizontal(|ui| {
+                // Notebook controls
+                if !self.is_notebook_mode {
+                    if ui.button("📖 Create Notebook").clicked() {
+                        self.show_create_notebook_dialog = true;
+                    }
+                } else {
+                    ui.label(format!("Page {} of {}", self.current_page_index + 1, self.pages.len()));
+                    
+                    if ui.button("◀").clicked() {
+                        self.previous_page();
+                    }
+                    
+                    if ui.button("▶").clicked() {
+                        self.next_page();
+                    }
+                    
+                    if ui.button("➕ Add Page").clicked() {
+                        self.add_new_page();
+                    }
+                    
+                    ui.separator();
+                }
+                
                 if ui.button("Clear").clicked() {
-                    self.strokes.clear();
-                    self.text_elements.clear();
+                    self.current_strokes_mut().clear();
+                    self.current_text_elements_mut().clear();
                     self.current_stroke.clear();
                     self.is_drawing = false;
                     self.text_input.clear();
@@ -901,7 +1377,7 @@ impl eframe::App for ScribbleApp {
                 
                 ui.separator();
                 
-                ui.label(format!("Strokes: {} | Text: {}", self.strokes.len(), self.text_elements.len()));
+                ui.label(format!("Strokes: {} | Text: {}", self.current_strokes().len(), self.current_text_elements().len()));
             });
             
             // Search bar (only shown when search is enabled)
@@ -975,10 +1451,14 @@ impl eframe::App for ScribbleApp {
                 
                 if response.drag_stopped() {
                     if self.is_drawing && self.current_stroke.len() > 1 {
-                        self.strokes.push(Stroke {
-                            points: self.current_stroke.clone(),
-                            color: self.stroke_color,
-                            width: self.stroke_width,
+                        let stroke_points = self.current_stroke.clone();
+                        let stroke_color = self.stroke_color;
+                        let stroke_width = self.stroke_width;
+                        
+                        self.current_strokes_mut().push(Stroke {
+                            points: stroke_points,
+                            color: stroke_color,
+                            width: stroke_width,
                         });
                     }
                     self.current_stroke.clear();
@@ -1071,10 +1551,13 @@ impl eframe::App for ScribbleApp {
                             ui.horizontal(|ui| {
                                 if ui.button("✅ Add").clicked() {
                                     if !self.text_input.trim().is_empty() {
-                                        self.text_elements.push(TextElement {
+                                        let text_content = self.text_input.clone();
+                                        let font_size = self.text_font_size;
+                                        
+                                        self.current_text_elements_mut().push(TextElement {
                                             position: text_pos,
-                                            text: self.text_input.clone(),
-                                            font_size: self.text_font_size,
+                                            text: text_content,
+                                            font_size,
                                         });
                                         self.text_input.clear();
                                         self.active_text_position = None;
@@ -1092,10 +1575,13 @@ impl eframe::App for ScribbleApp {
                             // Handle Ctrl+Enter to add text
                             if ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.ctrl) {
                                 if !self.text_input.trim().is_empty() {
-                                    self.text_elements.push(TextElement {
+                                    let text_content = self.text_input.clone();
+                                    let font_size = self.text_font_size;
+                                    
+                                    self.current_text_elements_mut().push(TextElement {
                                         position: text_pos,
-                                        text: self.text_input.clone(),
-                                        font_size: self.text_font_size,
+                                        text: text_content,
+                                        font_size,
                                     });
                                     self.text_input.clear();
                                     self.active_text_position = None;
@@ -1107,7 +1593,7 @@ impl eframe::App for ScribbleApp {
             }
             
             // Draw completed strokes
-            for stroke in &self.strokes {
+            for stroke in self.current_strokes() {
                 if stroke.points.len() > 1 {
                     let points: Vec<egui::Pos2> = stroke.points.iter().copied().collect();
                     painter.add(egui::Shape::line(
@@ -1135,7 +1621,7 @@ impl eframe::App for ScribbleApp {
             }
             
             // Draw text elements
-            for (index, text_element) in self.text_elements.iter().enumerate() {
+            for (index, text_element) in self.current_text_elements().iter().enumerate() {
                 let is_search_result = self.search_results.contains(&index);
                 let has_collision = self.text_collisions.contains(&index);
                 let is_selected = self.selected_text_elements.contains(&index);
@@ -1204,7 +1690,7 @@ impl eframe::App for ScribbleApp {
             }
             
             // Draw instructions if no content
-            if self.strokes.is_empty() && self.text_elements.is_empty() && !self.is_drawing && self.active_text_position.is_none() {
+            if self.current_strokes().is_empty() && self.current_text_elements().is_empty() && !self.is_drawing && self.active_text_position.is_none() {
                 let text_pos = response.rect.center();
                 let instruction_text = match self.current_tool {
                     Tool::Draw => "Click and drag to draw!",
@@ -1219,6 +1705,58 @@ impl eframe::App for ScribbleApp {
                     egui::Color32::GRAY,
                 );
             }
+            
+            // Draw drag and drop overlay when files are hovered
+            if self.is_file_hovered {
+                // Semi-transparent overlay
+                painter.rect_filled(
+                    response.rect,
+                    egui::Rounding::ZERO,
+                    egui::Color32::from_rgba_premultiplied(100, 150, 255, 60),
+                );
+                
+                // Drop instruction text
+                painter.text(
+                    response.rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "📄 Drop .scribble file to open\n(Supports both single pages and notebooks)",
+                    egui::FontId::proportional(24.0),
+                    egui::Color32::WHITE,
+                );
+                
+                // Border around the drop area
+                painter.rect_stroke(
+                    response.rect.shrink(5.0),
+                    egui::Rounding::from(10.0),
+                    egui::Stroke::new(3.0, egui::Color32::from_rgb(100, 150, 255)),
+                );
+            }
         });
+        
+        // Create notebook dialog
+        if self.show_create_notebook_dialog {
+            egui::Window::new("Create Notebook")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label("Number of pages:");
+                    ui.text_edit_singleline(&mut self.new_notebook_pages_input);
+                    
+                    ui.horizontal(|ui| {
+                        if ui.button("Create").clicked() {
+                            if let Ok(page_count) = self.new_notebook_pages_input.parse::<usize>() {
+                                if page_count > 0 && page_count <= 100 { // Reasonable limit
+                                    self.create_notebook(page_count);
+                                    self.show_create_notebook_dialog = false;
+                                }
+                            }
+                        }
+                        
+                        if ui.button("Cancel").clicked() {
+                            self.show_create_notebook_dialog = false;
+                        }
+                    });
+                });
+        }
     }
 }
